@@ -3,14 +3,14 @@ use std::collections::{BTreeSet, HashSet};
 use actix_web::{web, HttpResponse};
 use actix_web_macros::{delete, get, post, put};
 use indexmap::IndexMap;
-use meilisearch_core::update;
+use meilisearch_core::{update, Index};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::Data;
 use crate::error::{Error, ResponseError};
 use crate::helpers::Authentication;
 use crate::routes::{IndexParam, IndexUpdateResponse};
+use crate::Data;
 
 type Document = IndexMap<String, Value>;
 
@@ -45,7 +45,8 @@ async fn get_document(
 
     let reader = data.db.main_read_txn()?;
 
-    let internal_id = index.main
+    let internal_id = index
+        .main
         .external_to_internal_docid(&reader, &path.document_id)?
         .ok_or(Error::document_not_found(&path.document_id))?;
 
@@ -139,6 +140,37 @@ struct UpdateDocumentsQuery {
     primary_key: Option<String>,
 }
 
+fn create_index(data: &Data, uid: &str) -> Result<Index, ResponseError> {
+    if !uid
+        .chars()
+        .all(|x| x.is_ascii_alphanumeric() || x == '-' || x == '_')
+    {
+        return Err(Error::InvalidIndexUid.into());
+    }
+
+    let created_index = data.db.create_index(&uid).map_err(|e| match e {
+        meilisearch_core::Error::IndexAlreadyExists => e.into(),
+        _ => ResponseError::from(Error::create_index(e)),
+    })?;
+
+    data.db.main_write::<_, _, ResponseError>(|mut writer| {
+        created_index.main.put_name(&mut writer, uid)?;
+
+        created_index
+            .main
+            .created_at(&writer)?
+            .ok_or(Error::internal("Impossible to read created at"))?;
+
+        created_index
+            .main
+            .updated_at(&writer)?
+            .ok_or(Error::internal("Impossible to read updated at"))?;
+        Ok(())
+    })?;
+
+    Ok(created_index)
+}
+
 async fn update_multiple_documents(
     data: web::Data<Data>,
     path: web::Path<IndexParam>,
@@ -149,7 +181,8 @@ async fn update_multiple_documents(
     let index = data
         .db
         .open_index(&path.index_uid)
-        .ok_or(Error::index_not_found(&path.index_uid))?;
+        .ok_or(Error::index_not_found(&path.index_uid))
+        .or(create_index(&data, &path.index_uid))?;
 
     let reader = data.db.main_read_txn()?;
 
@@ -164,12 +197,10 @@ async fn update_multiple_documents(
             None => body
                 .first()
                 .and_then(find_primary_key)
-                .ok_or(meilisearch_core::Error::MissingPrimaryKey)?
+                .ok_or(meilisearch_core::Error::MissingPrimaryKey)?,
         };
 
-        schema
-            .set_primary_key(&id)
-            .map_err(Error::bad_request)?;
+        schema.set_primary_key(&id).map_err(Error::bad_request)?;
 
         data.db.main_write(|w| index.main.put_schema(w, &schema))?;
     }
@@ -222,7 +253,6 @@ async fn delete_documents(
         .db
         .open_index(&path.index_uid)
         .ok_or(Error::index_not_found(&path.index_uid))?;
-
 
     let mut documents_deletion = index.documents_deletion();
 
